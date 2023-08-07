@@ -1,259 +1,141 @@
+mod blinding;
+mod dleq;
+mod schnorr;
+mod shamir;
+
+use crate::blinding::blind_share;
+use crate::shamir::split_secret;
 use rand;
 use secp256kfun::hash::HashAdd;
-use secp256kfun::marker::{NonZero, Public, Secret, Zero};
-use secp256kfun::{g, s, Point, Scalar, G};
-use sha2::Sha256;
-use std::collections::BTreeMap;
+use secp256kfun::marker::{NonZero, Public};
+use secp256kfun::{g, Point, Scalar, G};
+use sha2::digest::FixedOutput;
+use sha2::{Digest, Sha256};
 
-struct DLEQ(Point, Scalar, Scalar);
+fn secret_key() -> Scalar {
+    Scalar::random(&mut rand::thread_rng())
+}
 
-fn dleq(ephemeral_pk: &Point, sk: &Scalar) -> DLEQ {
+fn public_key() -> Point {
+    let sk = secret_key();
+
+    g!(sk * G).normalize()
+}
+pub fn keypair() -> (Scalar, Point) {
+    let sk = secret_key();
     let pk = g!(sk * G).normalize();
-    let shared_point = g!(sk * ephemeral_pk).normalize();
-    let nonce = Scalar::<Secret, NonZero>::random(&mut rand::thread_rng());
 
-    let r1 = g!(nonce * G).normalize();
-    let r2 = g!(nonce * ephemeral_pk).normalize();
-
-    let challenge = Sha256::default()
-        .add(r1)
-        .add(r2)
-        .add(pk)
-        .add(ephemeral_pk)
-        .add(shared_point);
-
-    let e = Scalar::<Secret, NonZero>::from_hash(challenge);
-    let s = s!(nonce + e * sk).non_zero().expect("The nonce is random");
-
-    DLEQ(shared_point, e, s)
+    (sk, pk)
 }
 
-fn verify_dleq(ephemeral_pk: &Point, peer_pk: &Point, DLEQ(shared_point, e, s): &DLEQ) -> bool {
-    let r1 = g!(s * G - e * peer_pk).normalize();
-    let r2 = g!(s * ephemeral_pk - e * shared_point).normalize();
-
-    let challenge = Sha256::default()
-        .add(r1)
-        .add(r2)
-        .add(peer_pk)
-        .add(ephemeral_pk)
-        .add(shared_point);
-
-    e == &Scalar::<Secret, NonZero>::from_hash(challenge)
+struct PreimageDecryptionContract {
+    hash: Sha256,
+    amount: u64,
+    blinded_shares: Vec<Scalar<Public, NonZero>>,
+    ephemeral_pk: Point,
+    signature: (Point, Scalar<Public, NonZero>),
 }
 
-fn evaluate_polynomial(
-    coefficients: &[Scalar<Secret, Zero>],
-    x: Scalar<Secret, Zero>,
-) -> Scalar<Secret, Zero> {
-    coefficients
-        .iter()
-        .rev()
-        .fold(Scalar::<Secret, Zero>::zero(), |acc, coefficient| {
-            s!(acc * x + coefficient)
-        })
-}
-
-pub fn shamir_secret_sharing(
-    secret: Scalar<Secret, NonZero>,
-    num_shares: usize,
-) -> Vec<Scalar<Secret, NonZero>> {
-    assert!(num_shares >= 4);
-
-    let threshold = 2 * (num_shares / 3) + 1;
-
-    // We'll need to create a random polynomial of degree threshold - 1
-    // where the constant term is the secret.
-    let mut coefficients = vec![secret.mark_zero()];
-    let mut rng = rand::thread_rng();
-
-    for _ in 1..threshold {
-        coefficients.push(Scalar::random(&mut rng).mark_zero());
-    }
-
-    // Now we'll evaluate this polynomial at nonzero points to create the shares.
-    (1..=num_shares)
-        .map(|i| {
-            let scalar: Scalar<Secret, Zero> = Scalar::from(i as u32);
-            evaluate_polynomial(&coefficients, scalar)
-                .non_zero()
-                .expect("The coefficients are random")
-        })
-        .collect()
-}
-
-pub fn lagrange_multiplier(shares: Vec<&u32>) -> Vec<Scalar<Secret, NonZero>> {
-    shares
-        .iter()
-        .map(|i| {
-            shares
-                .iter()
-                .filter(|j| *j != i)
-                .map(|j| {
-                    let i: Scalar = Scalar::from(**i).non_zero().expect("We start from 1");
-                    let j: Scalar = Scalar::from(**j).non_zero().expect("We start from 1");
-
-                    let denominator_inverse = s!(j - i)
-                        .non_zero()
-                        .expect("We filtered the case j == i")
-                        .invert();
-
-                    s!(j * denominator_inverse)
-                })
-                .reduce(|a, b| s!(a * b))
-                .expect("We have at least one share")
-        })
-        .collect()
-}
-
-pub fn combine(shares: &BTreeMap<u32, Scalar<Public, Zero>>) -> Scalar<Public, Zero> {
-    shares
-        .values()
-        .zip(lagrange_multiplier(shares.keys().collect()))
-        .map(|(y, multiplier)| s!(y * multiplier))
-        .reduce(|a, b| s!(a + b))
-        .expect("We have at least one share")
-        .public()
-}
-
-fn blind_share(
-    share: &Scalar<Secret, NonZero>,
-    ephemeral_sk: &Scalar<Secret, NonZero>,
-    peer_public_key: &Point,
-) -> Scalar<Public, Zero> {
-    let shared_point = g!(ephemeral_sk * peer_public_key).normalize();
-    let shared_secret = Sha256::default().add(shared_point);
-    let blinding_factor = Scalar::<Secret, NonZero>::from_hash(shared_secret);
-
-    s!(share + blinding_factor).public()
-}
-
-pub fn unblind_share(
-    blinded_share: Scalar<Public, Zero>,
-    shared_point: Point,
-) -> Scalar<Public, Zero> {
-    let shared_secret = Sha256::default().add(shared_point);
-    let blinding_factor = Scalar::<Secret, NonZero>::from_hash(shared_secret);
-
-    s!(blinded_share - blinding_factor).public()
-}
-
-fn threshold_encrypt(
-    secret: &Scalar,
+fn encrypt(
+    preimage: &Scalar,
+    amount: u64,
     peers: &[Point],
     ephemeral_sk: &Scalar,
-) -> Vec<Scalar<Public, Zero>> {
-    shamir_secret_sharing(secret.clone(), peers.len())
+) -> PreimageDecryptionContract {
+    let hash = Sha256::default().add(preimage);
+    let blinded_shares = split_secret(preimage.clone(), peers.len())
         .iter()
         .zip(peers)
         .map(|(share, peer_public_key)| blind_share(share, &ephemeral_sk, peer_public_key))
-        .collect()
+        .collect();
+    let ephemeral_pk = g!(ephemeral_sk * G).normalize();
+
+    let mut message = Sha256::default()
+        .add(hash.clone().finalize().as_slice())
+        .add(&amount.to_be_bytes())
+        .add(ephemeral_pk);
+
+    for share in &blinded_shares {
+        message = message.add(share);
+    }
+
+    let signature = schnorr::sign(ephemeral_sk, message);
+
+    PreimageDecryptionContract {
+        hash,
+        amount,
+        blinded_shares,
+        ephemeral_pk,
+        signature,
+    }
+}
+
+fn verify(contract: &PreimageDecryptionContract, num_peers: usize) -> bool {
+    if contract.blinded_shares.len() != num_peers {
+        return false;
+    }
+
+    let mut message = Sha256::default()
+        .add(contract.hash.clone().finalize().as_slice())
+        .add(contract.amount.to_be_bytes())
+        .add(contract.ephemeral_pk);
+
+    for share in &contract.blinded_shares {
+        message = message.add(share);
+    }
+
+    schnorr::verify(&contract.ephemeral_pk, message, contract.signature)
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
+    use crate::blinding::unblind_share;
+    use crate::dleq::{prove, Proof};
+    use crate::shamir::combine;
+    use crate::{dleq, encrypt, keypair, public_key, secret_key, verify};
     use secp256kfun::marker::{NonZero, Public, Secret, Zero};
-    use secp256kfun::{g, Point, Scalar, G};
+    use secp256kfun::{Point, Scalar};
 
-    use super::{
-        blind_share, combine, dleq, evaluate_polynomial, shamir_secret_sharing, threshold_encrypt,
-        unblind_share, verify_dleq, DLEQ,
-    };
+    #[test]
+    fn test_encrypt_and_verify() {
+        let mut rng = rand::thread_rng();
 
-    fn keypair() -> (Scalar, Point) {
-        let sk = Scalar::<Secret, NonZero>::random(&mut rand::thread_rng());
-        let pk = g!(sk * G).normalize();
+        let preimage = secret_key();
+        let amount = 1000u64;
+        let ephemeral_sk = Scalar::<Secret, NonZero>::random(&mut rng);
 
-        (sk, pk)
+        let peers: Vec<Point> = (0..5).map(|_| public_key()).collect();
+
+        let encrypted_preimage = encrypt(&preimage, amount, &peers, &ephemeral_sk);
+
+        assert!(verify(&encrypted_preimage, peers.len()));
     }
 
     #[test]
-    fn test_dleq_proof_symmetry() {
-        let (sk_a, pk_a) = keypair();
-        let (sk_b, pk_b) = keypair();
-
-        let proof_a = dleq(&pk_a, &sk_b);
-        let proof_b = dleq(&pk_b, &sk_a);
-
-        assert_eq!(proof_a.0, proof_b.0);
-        assert!(verify_dleq(&pk_a, &pk_b, &proof_a));
-        assert!(verify_dleq(&pk_b, &pk_a, &proof_b));
-    }
-
-    #[test]
-    fn test_evaluate_polynomial() {
-        // Define coefficients for the polynomial: 4x^3 + 3x^2 + 2x + 1
-        let coefficients: Vec<Scalar<Secret, Zero>> = vec![
-            Scalar::from(1),
-            Scalar::from(2),
-            Scalar::from(3),
-            Scalar::from(4),
-        ];
-
-        let expected: Scalar<Secret, Zero> = Scalar::from(49);
-
-        assert_eq!(
-            expected,
-            evaluate_polynomial(&coefficients, Scalar::from(2))
-        );
-    }
-
-    #[test]
-    fn test_splitting_and_combining_secret() {
-        // We split the secret between five peers such that four peers can reconstruct it
-        let secret = Scalar::from(42u32).non_zero().unwrap();
-        let shares = shamir_secret_sharing(secret.clone(), 5);
-
-        let threshold_of_shares: BTreeMap<u32, Scalar<Public, Zero>> = shares
-            .iter()
-            .enumerate()
-            .take(4)
-            .map(|(x, y)| ((x + 1) as u32, y.clone().public().mark_zero()))
-            .collect();
-
-        assert_eq!(secret, combine(&threshold_of_shares).non_zero().unwrap());
-    }
-
-    #[test]
-    fn test_blinding_and_unblinding_shares() {
-        let (ephemeral_sk, ..) = keypair();
-        let (.., peer_pk) = keypair();
-
-        let share = Scalar::from(42u32).non_zero().unwrap();
-        let blinded_share = blind_share(&share, &ephemeral_sk, &peer_pk);
-
-        let shared_point = g!(ephemeral_sk * peer_pk).normalize();
-
-        assert_eq!(
-            share,
-            unblind_share(blinded_share, shared_point)
-                .non_zero()
-                .unwrap()
-        );
-    }
-
-    #[test]
-    fn test_integration() {
-        let secret = Scalar::random(&mut rand::thread_rng());
-
+    fn test_decryption() {
+        let preimage = secret_key();
         let (ephemeral_sk, ephemeral_pk) = keypair();
-
         let (peer_sks, peer_pks): (Vec<Scalar>, Vec<Point>) = (0..5).map(|_| keypair()).unzip();
 
-        let blinded_shares = threshold_encrypt(&secret, &peer_pks, &ephemeral_sk);
+        let encrypted_preimage = encrypt(&preimage, 1000u64, &peer_pks, &ephemeral_sk);
 
-        let dleqs: Vec<DLEQ> = peer_sks.iter().map(|sk| dleq(&ephemeral_pk, &sk)).collect();
+        assert!(verify(&encrypted_preimage, 5));
 
-        for (pk, dleq_proof) in peer_pks.iter().zip(&dleqs) {
-            assert!(verify_dleq(&ephemeral_pk, &pk, &dleq_proof));
+        let proofs: Vec<Proof> = peer_sks
+            .iter()
+            .map(|sk| prove(&ephemeral_pk, &sk))
+            .collect();
+
+        for (pk, proof) in peer_pks.iter().zip(&proofs) {
+            assert!(dleq::verify(&ephemeral_pk, &pk, &proof));
         }
 
-        let shares: Vec<Scalar<Public, Zero>> = dleqs
+        let shares: Vec<Scalar<Public, Zero>> = proofs
             .iter()
-            .zip(blinded_shares.iter())
-            .map(|(dleq_proof, blinded_share)| unblind_share(*blinded_share, dleq_proof.0))
+            .zip(encrypted_preimage.blinded_shares)
+            .map(|(proof, share)| unblind_share(share.mark_zero(), proof.0))
             .collect();
 
         let threshold_of_shares: BTreeMap<u32, Scalar<Public, Zero>> = shares
@@ -263,6 +145,6 @@ mod tests {
             .map(|(x, y)| ((x + 1) as u32, y.clone()))
             .collect();
 
-        assert_eq!(secret, combine(&threshold_of_shares).non_zero().unwrap());
+        assert_eq!(preimage, combine(&threshold_of_shares).non_zero().unwrap());
     }
 }
