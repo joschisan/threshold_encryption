@@ -32,7 +32,7 @@ pub fn split_secret(
         coefficients.push(Scalar::random(&mut rng).mark_zero());
     }
 
-    // Now we'll evaluate this polynomial at nonzero points to create the shares.
+    // We evaluate this polynomial at nonzero points to create the shares
     (0..num_shares)
         .map(|i| {
             let scalar: Scalar<Secret, Zero> = Scalar::from((i + 1) as u32);
@@ -47,22 +47,26 @@ pub fn lagrange_multiplier(shares: Vec<&u32>) -> Vec<Scalar<Secret, NonZero>> {
     shares
         .iter()
         .map(|i| {
-            shares
-                .iter()
-                .filter(|j| *j != i)
-                .map(|j| {
-                    let i: Scalar = Scalar::from(**i).non_zero().expect("We start from 1");
-                    let j: Scalar = Scalar::from(**j).non_zero().expect("We start from 1");
+            let filtered_shares = shares.iter().filter(|j| *j != i);
 
-                    let denominator_inverse = s!(j - i)
-                        .non_zero()
-                        .expect("We filtered the case j == i")
-                        .invert();
+            let numerator = filtered_shares
+                .clone()
+                .map(|j| Scalar::from(**j).non_zero().expect("We start from 1"))
+                .reduce(|a, b| s!(a * b))
+                .expect("We have at least one share");
 
-                    s!(j * denominator_inverse)
-                })
+            let i: Scalar = Scalar::from(**i).non_zero().expect("We start from 1");
+
+            let denominator_inverse = filtered_shares
+                .map(|j| Scalar::from(**j).non_zero().expect("We start from 1"))
+                .map(|j: Scalar| s!(j - i))
                 .reduce(|a, b| s!(a * b))
                 .expect("We have at least one share")
+                .non_zero()
+                .expect("We filtered the case j == i")
+                .invert();
+
+            s!(numerator * denominator_inverse)
         })
         .collect()
 }

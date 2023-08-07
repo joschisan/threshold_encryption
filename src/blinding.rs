@@ -31,13 +31,13 @@ pub fn unblind_share(
 #[cfg(test)]
 mod tests {
     use crate::blinding::{blind_share, unblind_share};
-    use crate::keypair;
+    use crate::{public_key, secret_key};
     use secp256kfun::{g, Scalar};
 
     #[test]
     fn test_blinding_and_unblinding_shares() {
-        let (ephemeral_sk, ..) = keypair();
-        let (.., peer_pk) = keypair();
+        let ephemeral_sk = secret_key();
+        let peer_pk = public_key();
 
         let share = Scalar::from(42u32).non_zero().unwrap();
         let blinded_share = blind_share(&share, &ephemeral_sk, &peer_pk).mark_zero();
