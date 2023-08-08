@@ -9,7 +9,6 @@ use rand;
 use secp256kfun::hash::HashAdd;
 use secp256kfun::marker::{NonZero, Public};
 use secp256kfun::{g, Point, Scalar, G};
-use sha2::digest::FixedOutput;
 use sha2::{Digest, Sha256};
 
 fn secret_key() -> Scalar {
@@ -39,8 +38,8 @@ struct PreimageDecryptionContract {
 fn encrypt(
     preimage: &Scalar,
     amount: u64,
-    peers: &[Point],
     ephemeral_sk: &Scalar,
+    peers: &[Point],
 ) -> PreimageDecryptionContract {
     let hash = Sha256::default().add(preimage);
     let blinded_shares = split_secret(preimage.clone(), peers.len())
@@ -92,11 +91,11 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::blinding::unblind_share;
-    use crate::dleq::{prove, Proof};
+    use crate::dleq::{prove};
     use crate::shamir::combine;
     use crate::{dleq, encrypt, keypair, public_key, secret_key, verify};
     use secp256kfun::marker::{NonZero, Public, Secret, Zero};
-    use secp256kfun::{Point, Scalar};
+    use secp256kfun::{g, Point, Scalar};
 
     #[test]
     fn test_encrypt_and_verify() {
@@ -108,9 +107,9 @@ mod tests {
 
         let peers: Vec<Point> = (0..5).map(|_| public_key()).collect();
 
-        let encrypted_preimage = encrypt(&preimage, amount, &peers, &ephemeral_sk);
+        let decryption_contract = encrypt(&preimage, amount, &ephemeral_sk, &peers);
 
-        assert!(verify(&encrypted_preimage, peers.len()));
+        assert!(verify(&decryption_contract, peers.len()));
     }
 
     #[test]
@@ -119,23 +118,25 @@ mod tests {
         let (ephemeral_sk, ephemeral_pk) = keypair();
         let (peer_sks, peer_pks): (Vec<Scalar>, Vec<Point>) = (0..5).map(|_| keypair()).unzip();
 
-        let encrypted_preimage = encrypt(&preimage, 1000u64, &peer_pks, &ephemeral_sk);
+        let decryption_contract = encrypt(&preimage, 1000u64, &ephemeral_sk, &peer_pks);
 
-        assert!(verify(&encrypted_preimage, 5));
+        assert!(verify(&decryption_contract, 5));
 
-        let proofs: Vec<Proof> = peer_sks
+        let shared_secrets: Vec<Point> = peer_sks
             .iter()
-            .map(|sk| prove(&ephemeral_pk, &sk))
+            .map(|sk| g!(sk * ephemeral_pk).normalize())
             .collect();
 
-        for (pk, proof) in peer_pks.iter().zip(&proofs) {
-            assert!(dleq::verify(&ephemeral_pk, &pk, &proof));
+        for ((sk, pk), shared_secret) in peer_sks.iter().zip(&peer_pks).zip(&shared_secrets) {
+            let proof = prove(sk, pk, &ephemeral_pk, shared_secret);
+            assert!(dleq::verify(&ephemeral_pk, pk, shared_secret, &proof));
         }
 
-        let shares: Vec<Scalar<Public, Zero>> = proofs
+        let shares: Vec<Scalar<Public, Zero>> = decryption_contract
+            .blinded_shares
             .iter()
-            .zip(encrypted_preimage.blinded_shares)
-            .map(|(proof, share)| unblind_share(share.mark_zero(), proof.0))
+            .zip(shared_secrets)
+            .map(|(share, shared_secret)| unblind_share(&share.mark_zero(), &shared_secret))
             .collect();
 
         let threshold_of_shares: BTreeMap<u32, Scalar<Public, Zero>> = shares

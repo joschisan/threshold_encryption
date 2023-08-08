@@ -19,8 +19,8 @@ pub(crate) fn blind_share(
 }
 
 pub fn unblind_share(
-    blinded_share: Scalar<Public, Zero>,
-    shared_point: Point,
+    blinded_share: &Scalar<Public, Zero>,
+    shared_point: &Point,
 ) -> Scalar<Public, Zero> {
     let shared_secret = Sha256::default().add(shared_point);
     let blinding_factor = Scalar::<Secret, NonZero>::from_hash(shared_secret);
@@ -46,7 +46,7 @@ mod tests {
 
         assert_eq!(
             share,
-            unblind_share(blinded_share, shared_point)
+            unblind_share(&blinded_share, &shared_point)
                 .non_zero()
                 .unwrap()
         );
