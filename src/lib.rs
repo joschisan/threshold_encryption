@@ -39,55 +39,33 @@ fn encrypt(
     amount: u64,
     ephemeral_sk: &Scalar,
     peers: &[Point],
-) -> (PreimageDecryptionContract, (Point, Scalar<Public, NonZero>)) {
+) -> PreimageDecryptionContract {
     let hash = Sha256::default().add(preimage);
+
     let blinded_shares = split_secret(preimage.clone(), peers.len())
         .iter()
         .zip(peers)
         .map(|(share, peer_public_key)| blind_share(share, &ephemeral_sk, peer_public_key))
         .collect();
+
     let ephemeral_pk = g!(ephemeral_sk * G).normalize();
 
-    let mut message = Sha256::default()
-        .add(hash.clone().finalize().as_slice())
-        .add(&amount.to_be_bytes())
-        .add(ephemeral_pk);
-
-    for share in &blinded_shares {
-        message = message.add(share);
-    }
-
-    let contract = PreimageDecryptionContract {
+    PreimageDecryptionContract {
         hash,
         amount,
         blinded_shares,
         ephemeral_pk,
-    };
-
-    let signature = schnorr::sign(ephemeral_sk, message);
-
-    (contract, signature)
+    }
 }
 
-fn verify(
-    contract: &PreimageDecryptionContract,
-    num_peers: usize,
-    signature: (Point, Scalar<Public, NonZero>),
-) -> bool {
-    if contract.blinded_shares.len() != num_peers {
-        return false;
-    }
-
-    let mut message = Sha256::default()
+fn contract_hash(contract: &PreimageDecryptionContract) -> Sha256 {
+    contract
+        .blinded_shares
+        .iter()
+        .fold(Sha256::default(), |acc, share| acc.add(share))
         .add(contract.hash.clone().finalize().as_slice())
-        .add(contract.amount.to_be_bytes())
-        .add(contract.ephemeral_pk);
-
-    for share in &contract.blinded_shares {
-        message = message.add(share);
-    }
-
-    schnorr::verify(&contract.ephemeral_pk, message, signature)
+        .add(&contract.amount.to_be_bytes())
+        .add(contract.ephemeral_pk)
 }
 
 #[cfg(test)]
@@ -97,24 +75,9 @@ mod tests {
     use crate::blinding::unblind_share;
     use crate::dleq::prove;
     use crate::shamir::combine;
-    use crate::{dleq, encrypt, keypair, public_key, secret_key, verify};
-    use secp256kfun::marker::{NonZero, Public, Secret, Zero};
+    use crate::{dleq, encrypt, keypair, secret_key};
+    use secp256kfun::marker::{Public, Zero};
     use secp256kfun::{g, Point, Scalar};
-
-    #[test]
-    fn test_encrypt_and_verify() {
-        let mut rng = rand::thread_rng();
-
-        let preimage = secret_key();
-        let amount = 1000u64;
-        let ephemeral_sk = Scalar::<Secret, NonZero>::random(&mut rng);
-
-        let peers: Vec<Point> = (0..5).map(|_| public_key()).collect();
-
-        let (contract, signature) = encrypt(&preimage, amount, &ephemeral_sk, &peers);
-
-        assert!(verify(&contract, peers.len(), signature));
-    }
 
     #[test]
     fn test_decryption() {
@@ -122,9 +85,9 @@ mod tests {
         let (ephemeral_sk, ephemeral_pk) = keypair();
         let (peer_sks, peer_pks): (Vec<Scalar>, Vec<Point>) = (0..5).map(|_| keypair()).unzip();
 
-        let (contract, signature) = encrypt(&preimage, 1000u64, &ephemeral_sk, &peer_pks);
+        let contract = encrypt(&preimage, 1000u64, &ephemeral_sk, &peer_pks);
 
-        assert!(verify(&contract, 5, signature));
+        assert_eq!(contract.blinded_shares.len(), 5);
 
         let shared_secrets: Vec<Point> = peer_sks
             .iter()
