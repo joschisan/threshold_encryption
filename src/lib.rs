@@ -32,7 +32,6 @@ struct PreimageDecryptionContract {
     amount: u64,
     blinded_shares: Vec<Scalar<Public, NonZero>>,
     ephemeral_pk: Point,
-    signature: (Point, Scalar<Public, NonZero>),
 }
 
 fn encrypt(
@@ -40,7 +39,7 @@ fn encrypt(
     amount: u64,
     ephemeral_sk: &Scalar,
     peers: &[Point],
-) -> PreimageDecryptionContract {
+) -> (PreimageDecryptionContract, (Point, Scalar<Public, NonZero>)) {
     let hash = Sha256::default().add(preimage);
     let blinded_shares = split_secret(preimage.clone(), peers.len())
         .iter()
@@ -58,18 +57,23 @@ fn encrypt(
         message = message.add(share);
     }
 
-    let signature = schnorr::sign(ephemeral_sk, message);
-
-    PreimageDecryptionContract {
+    let contract = PreimageDecryptionContract {
         hash,
         amount,
         blinded_shares,
         ephemeral_pk,
-        signature,
-    }
+    };
+
+    let signature = schnorr::sign(ephemeral_sk, message);
+
+    (contract, signature)
 }
 
-fn verify(contract: &PreimageDecryptionContract, num_peers: usize) -> bool {
+fn verify(
+    contract: &PreimageDecryptionContract,
+    num_peers: usize,
+    signature: (Point, Scalar<Public, NonZero>),
+) -> bool {
     if contract.blinded_shares.len() != num_peers {
         return false;
     }
@@ -83,7 +87,7 @@ fn verify(contract: &PreimageDecryptionContract, num_peers: usize) -> bool {
         message = message.add(share);
     }
 
-    schnorr::verify(&contract.ephemeral_pk, message, contract.signature)
+    schnorr::verify(&contract.ephemeral_pk, message, signature)
 }
 
 #[cfg(test)]
@@ -91,7 +95,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::blinding::unblind_share;
-    use crate::dleq::{prove};
+    use crate::dleq::prove;
     use crate::shamir::combine;
     use crate::{dleq, encrypt, keypair, public_key, secret_key, verify};
     use secp256kfun::marker::{NonZero, Public, Secret, Zero};
@@ -107,9 +111,9 @@ mod tests {
 
         let peers: Vec<Point> = (0..5).map(|_| public_key()).collect();
 
-        let decryption_contract = encrypt(&preimage, amount, &ephemeral_sk, &peers);
+        let (contract, signature) = encrypt(&preimage, amount, &ephemeral_sk, &peers);
 
-        assert!(verify(&decryption_contract, peers.len()));
+        assert!(verify(&contract, peers.len(), signature));
     }
 
     #[test]
@@ -118,9 +122,9 @@ mod tests {
         let (ephemeral_sk, ephemeral_pk) = keypair();
         let (peer_sks, peer_pks): (Vec<Scalar>, Vec<Point>) = (0..5).map(|_| keypair()).unzip();
 
-        let decryption_contract = encrypt(&preimage, 1000u64, &ephemeral_sk, &peer_pks);
+        let (contract, signature) = encrypt(&preimage, 1000u64, &ephemeral_sk, &peer_pks);
 
-        assert!(verify(&decryption_contract, 5));
+        assert!(verify(&contract, 5, signature));
 
         let shared_secrets: Vec<Point> = peer_sks
             .iter()
@@ -132,7 +136,7 @@ mod tests {
             assert!(dleq::verify(&ephemeral_pk, pk, shared_secret, &proof));
         }
 
-        let shares: Vec<Scalar<Public, Zero>> = decryption_contract
+        let shares: Vec<Scalar<Public, Zero>> = contract
             .blinded_shares
             .iter()
             .zip(shared_secrets)
