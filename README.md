@@ -30,7 +30,20 @@ Now the gateway founds a transaction with the decryption contract as output.
 
 ### Security Argument for User
 
-The only way to obtain the shared secrets for a ephemeral keypair is to submit a valid decryption contract with this ephemeral keypair to the broadcast with the correct amount of funding. Since the user only signs valid decryption contracts and the guardians canot falsify the shares secrets the decryption is guaranteed to succeed, hence the funding will be accesible with the ephemeral key pair. 
+A honest guardian will compute the shared secret if and only if the signed contract is funded with the correct amount. In that case, however, the contracts
+decryption is guaranteed to be successful and the funds can be claimed by the ephemeral key.
+
+If an attacker where able to obtain the secret preimage without funding the contract correctly, this means that the attacker was able 
+to solve at least one instance of the computational Diffie Hellman problem, which we assume to be hard.
+
+### Security Argument for Guardian
+
+The question is whether the repeated decryption of different decryption contracts leaks information on 
+the guardians static private key to an attacker. As we require the contract to be signed by the attacker in order to perform a key exchange, 
+this implicitly proofs knowledge of the ephemeral private key. Therefore the user could perform the exchange itself
+and no additional knowledge. 
+
+Therefore, the remaining question is whether the repeated creation of discrete log equality proofs leaks information on the guardians static private key.
 
 ## Discrete Log Equality Proof
 
